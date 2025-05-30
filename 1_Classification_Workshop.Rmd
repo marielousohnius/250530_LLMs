@@ -1,0 +1,613 @@
+---
+title: "Classifying Texts with LLMs: A Hands-on Workshop"
+author: "Marie-Lou Sohnius"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::downcute:
+    self_contained: true
+    default_style: "dark"
+    downcute_theme: "chaos"
+    code_folding: show
+    fig_crop: false
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(tidyverse, httr, jsonlite, knitr, mall)
+```
+
+# Workshop Agenda
+
+1.  Define the classification task
+2.  Explore sample data
+3.  Build and refine prompts
+4.  Generate and compare outputs
+5.  Reflect on strengths and limitations
+
+------------------------------------------------------------------------
+
+# 1. Task Description: Country–Right–Stance Classification
+
+In this task, we aim to classify short texts—such as headlines, quotes,
+or short news articles—based on three dimensions:
+
+1.  **Country** or geographic context mentioned\
+2.  **Type of right** being referenced (if any)\
+3.  **Stance** toward immigrant rights
+
+This goes beyond simple topic classification. We’re interested in
+*where* immigrant rights are discussed, *which* rights are referenced,
+and *how* they are framed in public discourse.
+
+------------------------------------------------------------------------
+
+### What Are We Classifying?
+
+| Dimension | Description |
+|------------------|------------------------------------------------------|
+| **Country** | Which country (or countries) the article references, if identifiable |
+| **Right** | The type of right being discussed (if any): voting, welfare, healthcare, work, citizenship |
+| **Stance** | The position the text takes toward immigrant rights: supportive, oppositional, neutral, or unclear |
+
+------------------------------------------------------------------------
+
+### Why Use LLMs?
+
+Traditionally, researchers rely on human coders to label texts. This
+process can be:
+
+-   **Slow** and labour-intensive\
+-   **Hard to scale** beyond small datasets\
+-   **Subjective**—coders may interpret the same sentence differently
+    *(models are also biased)*\
+-   **Inconsistent** across coding rounds or coders
+
+Large Language Models (LLMs) like ChatGPT, Claude, or open-source models
+(e.g. LLaMA) offer an appealing alternative:
+
+-   They can process thousands of texts in minutes\
+-   They generate consistent outputs for consistent prompts\
+-   They can be deployed locally or through APIs
+
+However, LLMs also raise **methodological concerns**:
+
+-   Are the classifications accurate?\
+-   Are they replicable?\
+-   Do they reinforce existing biases?\
+-   How should we evaluate their performance?
+
+------------------------------------------------------------------------
+
+### Country Detection
+
+Try to identify which **country** or **region** is being referenced in
+the text. This helps contextualise the policy environment. If no clear
+country is named, label it as `"Unclear"`.
+
+In production settings, you could:
+
+-   Use Named Entity Recognition (NER)
+
+-   Match keywords to a country list
+
+-   Add a rule-based fallback for place names or cities
+
+------------------------------------------------------------------------
+
+### Right Categories
+
+```{r right-table, echo=FALSE}
+right_labels <- data.frame(
+  Right = c("Voting", "Welfare", "Healthcare", "Work", "Citizenship", "None/Other"),
+  Description = c(
+    "Right to vote in local or national elections",
+    "Access to welfare benefits or social protections",
+    "Access to healthcare services",
+    "Legal permission to work or hold employment",
+    "Naturalisation or acquisition of legal citizenship status",
+    "No clear right mentioned or not one of the core categories"
+  )
+)
+kable(right_labels, caption = "Right Categories for Classification")
+```
+
+------------------------------------------------------------------------
+
+### Stance Classification
+
+We define four categories of stance, which we’ll use throughout the
+workshop:
+
+```{r stance-table, echo=FALSE}
+stance_labels <- data.frame(
+  Label = c("Supportive", "Oppositional", "Neutral/Descriptive", "Ambiguous"),
+  Definition = c(
+    "The actor or group is portrayed as **supporting immigrant rights**, such as advocating for voting, healthcare, or welfare access.",
+    "The actor or group is portrayed as **opposing immigrant rights**, through criticism, restriction, or denial of such rights.",
+    "The article **describes immigrant rights issues** without attributing a clear stance to any actor, or simply presents facts or debate.",
+    "The text is too **ambiguous, sarcastic, ironic, or vague** to determine any clear actor-based stance."
+  )
+)
+
+kable(stance_labels, caption = "Stance Categories (Actor-Oriented Interpretation)")
+
+```
+
+------------------------------------------------------------------------
+
+As we go through the hands-on section, you’ll extract **country**,
+**right**, and **stance** for each text. These three layers help us
+build a richer, multi-dimensional view of public narratives around
+immigrant rights.
+
+When working on a project like this, it is simple to "just ask ChatGPT"
+on what to do. But don't be fooled, the work starts before we turn to
+the code.
+
+> This is not just a coding task, it’s also a set of **theoretical
+> choices**. What counts as a "right"? What constitutes "support"? Is
+> "Germany" mentioned as a political actor or merely a geographic
+> reference? LLMs can help us scale this process, but they need
+> carefully designed prompts to guide them.
+
+# 2. LLaMA Basics: Running a Local LLM for Text Classification
+
+Before we dive into classification tasks, let’s go over the
+**fundamentals of using LLaMA locally** in RStudio via Ollama. This
+setup allows you to run a powerful LLM on your own machine—no internet
+or external APIs required.
+
+------------------------------------------------------------------------
+
+## 2.1 Choosing a Model
+
+You can find available models on <https://ollama.com/library>. For text
+classification, I recommend:
+
+| Model     | Strengths                                          | Size   |
+|-----------|----------------------------------------------------|--------|
+| `llama3`  | General-purpose, instruction-tuned, good reasoning | 8B–70B |
+| `gemma3`  | Lightweight and fast; built by Google DeepMind     | 2B–27B |
+| `mistral` | Compact, open-source model with strong performance | 7B     |
+
+For this workshop, we use `gemma3` or `ollama3.2`.
+
+------------------------------------------------------------------------
+
+## 2.2 Initialising LLaMA in R
+
+Start by pulling the model (first time only), then testing the
+connection and activating it.
+
+```{r}
+# Download the model (once)
+ollamar::pull("gemma3") # This only downloads the model if not already present
+
+# Test if Ollama is running
+ollamar::test_connection()
+
+# Use the model
+llm_use(
+  backend = "ollama",
+  model = "gemma3",
+  seed = 30052025,  # For reproducibility
+  temperature = 0  # Ensures deterministic output
+)
+```
+
+------------------------------------------------------------------------
+
+## 2.3 Basic Functionalities
+
+Once your model is ready, you can use high-level functions for common
+NLP tasks:
+
+### Sentiment Analysis
+
+```{r}
+# Sentiment analysis
+tibble(text = c("This policy is great!", "I oppose this reform")) |>
+  llm_sentiment(text)
+```
+
+Let's check what's happening under the hood when we run this command!
+
+```{r}
+statements <- c("This policy is great!", "I oppose this reform") 
+llm_vec_sentiment(statements, 
+                    options = c("positive", "negative", "neutral"), 
+                    preview = TRUE)
+
+```
+
+### Classification
+
+```{r}
+# Classifying words into categories
+tibble(thing = c("passport", "tax", "hospital")) |>
+  llm_classify(thing, labels = c("government", "finance", "health"))
+```
+
+### Content Synthesis
+
+```{r}
+# Summarising text
+tibble(statement = c("The UK government has proposed a new policy to streamline the naturalisation process for long-term residents, particularly those who have contributed consistently through employment and tax payments. The proposal includes a five-year minimum residency requirement, basic language and civic knowledge assessments, and waived application fees for individuals working in key public sectors such as healthcare and education. Officials say the goal is to encourage social integration and reward commitment to the UK. Critics argue the policy may exclude vulnerable groups who struggle to meet formal criteria. The policy will be debated in Parliament next month.")) |>
+  llm_summarize(statement, max_words = 8)
+```
+
+### Custom Prompts
+
+These functions are great for quick prototyping—but for more control,
+we’ll use `llm_custom()` with structured prompts.
+
+```{r}
+# Custom prompt for tone classification
+tibble(headline = "Aliens land in Yorkshire, demand access to NHS") |>
+  llm_custom(col = headline,
+    prompt = "Please read the following headline and classify its tone as one of the following: 
+    [serious, humorous, sensationalist, neutral]. 
+    Return only the tone label. Headline: {{headline}}"
+  )
+
+```
+
+------------------------------------------------------------------------
+
+## 2.4 Going to the Terminal (Optional but Fun)
+
+You can also interact with LLaMA directly in your terminal, outside of
+RStudio.
+
+### Step 1: Open a Terminal
+
+From your console (Mac/Linux) or PowerShell (Windows), type:
+
+``` bash
+ollama run llama3
+```
+
+Or, for gemma3:
+
+``` bash
+ollama run gemma3
+```
+
+You’ll be dropped into a chat-style interface where you can enter
+free-form prompts, like:
+
+``` text
+Classify this headline:
+"Non-citizens to be granted local voting rights in London"
+```
+
+Or:
+
+``` text
+Give me a JSON summary of this sentence:
+"The German government is proposing changes to immigration law."
+```
+
+### Step 2: Quit the Session
+
+To exit, use `/bye`.
+
+This is a great way to test prompts before scripting them in RStudio,
+especially if you want to assess the response you may receive from a
+model.
+
+------------------------------------------------------------------------
+
+In the next section, we’ll combine what we’ve learned to classify real
+Guardian texts using structured prompts.
+
+```{r headlines}
+
+df <- read.csv("guardian_immigrant_rights_articles.csv")
+
+# Sample 5 rows 
+subset <- df %>%
+  sample_n(5)
+
+subset
+```
+
+------------------------------------------------------------------------
+
+# 3. First Prompt: Zero-shot Classification with LLaMA
+
+Now that we understand what we want to classify—**country**, **right**,
+and **stance**—let’s try it using **LLaMA**, a local large language
+model you can run directly in R using the `ollama` backend.
+
+Here, we’ll start with a **basic zero-shot prompt**, meaning we give the
+model no examples—just clear instructions.
+
+------------------------------------------------------------------------
+
+### Example: Body Classification
+
+We’ll classify a headline by prompting the model to extract three
+things:
+
+-   **Country** referenced (if any)
+-   **Right** being discussed (if any)
+-   **Stance** of the main actor toward that right
+
+We’ll use `llm_custom()` to apply a tailored instruction prompt.
+
+```{r}
+# Create a clear, structured prompt
+prompt <- paste(
+  "Extract the following from the text below:",
+  "1. Country (or region) mentioned. Return 'Unclear' if none.",
+  "2. Right being discussed.",
+  "3. Stance of the main actor or group mentioned.",
+  "Return only a JSON object with the keys: country, right, stance.",
+  "Text:"
+)
+
+# Run prompt using LLaMA
+subset |>
+  llm_custom(col = webTitle, prompt = prompt) |>
+  mutate(
+    clean_json = str_remove_all(.pred, "^```json\\s*|\\s*```$"),  # Remove ```json block
+    parsed = map(clean_json, ~ jsonlite::fromJSON(.x))
+  ) |>
+  tidyr::unnest_wider(parsed)
+
+```
+
+------------------------------------------------------------------------
+
+### Your Turn
+
+Try replacing the text we classify with your own examples and rerun the
+code. You can also tweak the prompt to clarify instructions, add
+examples, or rephrase ambiguous terms.
+
+This approach allows us to:
+
+-   Stay **fully local and private**
+-   Use **structured output** (JSON) for easy downstream analysis
+-   Rapidly iterate across multiple headlines
+
+```{r}
+# Load sample headline
+headline_to_classify <- tibble::tibble(
+  headline = "Immigrants draining NHS, says MP"
+)
+
+# Reuse the same structured prompt
+prompt <- paste(
+  "Your prompt"
+)
+
+# Run the classification
+
+
+```
+
+In the next step, we’ll compare zero-shot to few-shot prompting and
+refine our results.
+
+------------------------------------------------------------------------
+
+# 4. Improved Prompt with Instructions
+
+In many cases, zero-shot prompts are too vague or underspecified. We can
+improve performance by giving the model **clearer instructions** and
+restricting the output space.
+
+Here’s a more structured and robust prompt. It:
+
+-   Defines the model’s role (a social science researcher)
+-   Narrows down the response format to four clear categories
+-   Enforces concise, label-only output
+
+------------------------------------------------------------------------
+
+### Prompt Instructions
+
+```         
+You are a social science researcher. Classify the following headline according to the stance of the main actor or group toward immigrant rights.
+"Extract the following from the text below:",
+  "1. Country mentioned. Return 'Unclear' if none.",
+  "2. Right being discussed. Choose one of: voting, welfare, healthcare, work, citizenship, or none.",
+  "3. Stance of the main actor or group mentioned. Choose one of: supportive, oppositional, neutral/descriptive, ambiguous.",
+  "Text:"
+```
+
+------------------------------------------------------------------------
+
+### Example: Run in R with LLaMA
+
+We’ll try this improved prompt on the sane headlines.
+
+```{r}
+# Improved instruction-based prompt
+instruction_prompt <- paste(
+  "You are a social science researcher.",
+  "Classify the following headline according to the stance of the main actor or group toward immigrant rights.",
+  "Extract the following from the text below:",
+  "1. Country mentioned. Return 'Unclear' if none.",
+  "2. Right being discussed. Choose one of: voting, welfare, healthcare, work, citizenship, or none.",
+  "3. Stance of the main actor or group mentioned. Choose one of: supportive, oppositional, neutral/descriptive, ambiguous.",
+  "Return only a JSON object with the keys: country, right, stance.",
+  "Text:"
+)
+
+# Run prompt
+subset |>
+  llm_custom(col = webTitle, prompt = instruction_prompt) |>
+  mutate(
+    clean_json = str_remove_all(.pred, "^```json\\s*|\\s*```$"),  # Remove ```json block
+    parsed = map(clean_json, ~ jsonlite::fromJSON(.x))
+  ) |>
+  tidyr::unnest_wider(parsed)
+
+```
+
+------------------------------------------------------------------------
+
+### Output Interpretation
+
+For the headline:
+
+> `"Government proposes new path to naturalisation"`
+
+you might expect the model to return:
+
+``` r
+supportive
+```
+
+This reflects that the **government** is presented as **supporting an
+expansion of rights** (i.e. access to citizenship).
+
+------------------------------------------------------------------------
+
+### Try This Yourself
+
+Swap in another headline from earlier (e.g.,
+`"Mixed reactions to non-citizen access to benefits"`) and see what
+happens.
+
+Then, try tweaking the prompt to:
+
+-   Add an example or two
+-   Rephrase “stance” as “attitude” or “position”
+-   Add “Return only one word” or “Do not explain your answer” for even
+    stricter output
+
+> This iterative refinement is **prompt engineering in practice** and it
+> can drastically improve classification accuracy. If you are uncertain
+> which prompt will yield optimal results, it may be helpful to test a
+> selection of prompts on a small batch of pre-labelled data and compare
+> performance.
+
+------------------------------------------------------------------------
+
+# 5. Few-shot Prompting
+
+Few-shot prompting adds examples to improve performance:
+
+```         
+Classify the stance of the following headline toward immigrant rights. Return one of:
+[supportive, oppositional, neutral, unclear]
+
+Examples:
+- "New law grants immigrants access to healthcare" → supportive  
+- "MPs debate immigrant welfare abuse" → oppositional  
+- "Study shows immigrants and natives access same benefits" → neutral
+
+Headline: "[Your headline here]"
+```
+
+Try pasting this into the LLM with the sampled or new headlines!
+
+```{r}
+
+```
+
+------------------------------------------------------------------------
+
+# 6. Evaluation & Trade-offs
+
+How should we evaluate LLM-based classification?
+
+-   **Manual spot checks**
+
+-   **Compare to gold labels**
+
+-   **Consistency across variations**
+
+Discussion points:
+
+-   How do you know if a label is correct?
+
+-   What level of accuracy is acceptable in your research?
+
+------------------------------------------------------------------------
+
+# 7. Scaling & Reproducibility
+
+If you were to classify hundreds of texts:
+
+-   You could use a local model like `llama` with Ollama
+-   You can cache responses to avoid repeated calls
+-   You should **log your prompts** and model versions
+
+You can simulate a batch below:
+
+```{r fake-batch}
+set.seed(42)
+classified <- tibble(
+  text = subset$webTitle,
+  model_output = sample(c("supportive", "oppositional", "neutral", "unclear"), length(subset$webTitle), replace = TRUE)
+)
+classified
+```
+
+------------------------------------------------------------------------
+
+# 8. Group Exercise
+
+**Try this with a partner:**
+
+1.  Pick 3-5 headlines (from a dataset or real examples)
+
+2.  Write your own prompts to classify them (e.g., tone, topic, frame)
+
+3.  Run the prompts with an LLM
+
+4.  Compare outputs and discuss:
+
+    -   What worked well? Why?
+    -   What confused the model?
+    -   How consistent were the results across examples?
+    -   Would a traditional coder have done better or worse?
+    -   How does the prompt wording affect the classification?
+    -   What would you change if you scaled this to 10,000 headlines?
+
+------------------------------------------------------------------------
+
+### Discussion Prompts
+
+-   **Bias:** Did the model show any political or cultural bias? How
+    would you detect and mitigate this?
+-   **Scaling:** What are the risks of using this approach on a large
+    scale? What trade-offs (e.g., speed vs. accuracy) emerge?
+-   **Reliability:** Would you trust these labels in a published paper?
+    Under what conditions?
+-   **Prompt Design:** What makes a classification prompt clear or
+    ambiguous?
+-   **Human vs. Machine:** Should this task be delegated to a model? Why
+    or why not?
+
+------------------------------------------------------------------------
+
+# 9. Wrap-Up Reflections
+
+**Methodological trade-offs**:
+
+-   LLMs are scalable but not always explainable
+-   Prompt design is a research decision
+-   We must balance efficiency with transparency
+
+------------------------------------------------------------------------
+
+# 10. Further Resources
+
+-   [Ollama installation guide](https://ollama.com/)
+-   [Chae & Davidson (2025) - Large Language Models for Text
+    Classification]
+-   [Bann & Wright (2025) - NCRM Briefing on AI and Methods]
+
+------------------------------------------------------------------------
+
+Thanks for participating! Feel free to email me if you'd like to
+experiment with your own data or build on this workflow.
